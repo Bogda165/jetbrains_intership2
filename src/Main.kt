@@ -180,20 +180,26 @@ data class FileInfo(val index: Long, val size: Long, val hardLinkAmount: Int) {
 private fun walkDir(dir: Path, closure: (Path, FileType) -> Result<Unit>) {
     check(Files.isDirectory(dir))
 
-    Files.list(dir).forEach { path ->
-        val fileTypeResult = FileType.getTypeFromPath(path)
-        if (fileTypeResult.isSuccess) {
+    try {
+        Files.list(dir).forEach { path ->
+            val fileTypeResult = FileType.getTypeFromPath(path)
+            if (fileTypeResult.isSuccess) {
 
-            val fileType = fileTypeResult.getOrElse { return@forEach }
+                val fileType = fileTypeResult.getOrElse { return@forEach }
 
-            if (closure(path, fileType).isFailure) { return@forEach }
+                if (closure(path, fileType).isFailure) {
+                    return@forEach
+                }
 
-            if (fileType == FileType.DIRECTORY) {
-                walkDir(path, closure)
+                if (fileType == FileType.DIRECTORY) {
+                    walkDir(path, closure)
+                }
+            } else {
+                println("Skipping ${path}: Unable to determine file type")
             }
-        } else {
-            println("Skipping ${path}: Unable to determine file type")
         }
+    }catch(e: Exception) {
+        println("Permission denied for $dir")
     }
 
 }
