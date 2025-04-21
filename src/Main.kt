@@ -27,38 +27,62 @@ class SolutionResult(
     val totalSize: Long,
 )
 
-/***
-Key file types:
-- regular file
-- directory
-- symbolic link
-- hard link
-
-Solution description:
-    - As everything on Linux is file, I think its reasonable to count ALL files INCLUDING DIRECTORIES, SYMLINKS, and the etc.
-        - Directoires: I will count the size of a directory file, usually its quite small.
-        - Symlink: I will count the size of symlink itself, usually its very small.
-        - Regular File: I will count just its size
-    - Hard links
-        - As hard links are often used in fs I will count them as well. The task says "size that will be freed on the disk", so we have to work out situations where 2 or more hardlink points on the same file, while actual inode(file) is being freed only once.
-        - The most popular fs prohibit using (users space)hardlinks on directories. I will not consider cases when somehow hardlink is created on a directory (except . and ..)
-    - I assume that files I work with are isolated, and nothing else is using their inodes in any way.
-
-    Example 1:
-        Hardlink -> inode 2
-        File -> inode 2
-    Result:
-        fileSized -> {path: hardlink_path, size: inode2_size; path: file_path, size: indode2_size}
-        TotalSize -> inode2 size
-----------------------------
-    Example 2:
-        Hardlink_outside of dir -> inode
-        File -> inode
-    Result:
-        fileSized -> path: {file_path, size: inode_size}
-        TotalSize -> 0 (Because when the directory is deleted, nothing is freed on the disk)
-
-**/
+/**
+ * Key file types handled:
+ * - Regular files: Standard data files with content.
+ * - Directories: File system containers that hold other files and directories.
+ * - Symbolic links: Special files that point to other files or directories.
+ * - Hard links: Multiple directory entries pointing to the same inode.
+ *
+ * Sparse files are not specially handled in the current implementation as calculating their actual
+ * disk usage requires additional system commands. A potential implementation approach would be:
+ * - For each file, compare: logical size vs actual blocks used (via `du -h file * block_size`)
+ * - Return the smaller of these values as the true disk usage
+ *
+ * Solution approach:
+ * - Since everything in Linux is represented as a file, this implementation counts ALL file types:
+ *   - Directories: Counts the size of the directory entry itself (typically small)
+ *   - Symbolic links: Counts the size of the link itself, not the target (typically small)
+ *   - Regular files: Counts the full file size
+ *
+ * Hard link handling:
+ * - The goal is to calculate "size that will be freed on disk" when files are deleted
+ * - When multiple hard links point to the same inode, the actual disk space is only freed
+ *   when the last hard link to that inode is deleted
+ * - This implementation tracks files by inode to avoid double-counting
+ * - Directory hard links (beyond "." and "..") are not considered, as most filesystems
+ *   prohibit user-created hard links to directories
+ *
+ * Assumptions:
+ * - Files being processed are isolated, with no external hard links to their inodes
+ * - We have appropriate permissions to access all files in the specified directories
+ *
+ * Examples:
+ *
+ * Example 1 - Hard links within counted area:
+ *
+ *   hardlink1 -> inode2
+ *
+ *   file1 -> inode2
+ *
+ * Result:
+ *
+ *   Individual file sizes: {path: hardlink1_path, size: inode2_size; path: file1_path, size: inode2_size}
+ *
+ *   Total size freed: inode2_size (counted only once)
+ *
+ * Example 2 - Hard link outside counted area:
+ *
+ *   external_hardlink -> inode3 (outside target directory)
+ *
+ *   file2 -> inode3 (inside target directory)
+ *
+ * Result:
+ *
+ *   Individual file sizes: {path: file2_path, size: inode3_size}
+ *
+ *   Total size freed: 0 (because the inode still has an external reference)
+ */
 
 /// An optimization for getting file type
 private enum class FileType {
@@ -136,23 +160,21 @@ private fun getHardLinkAmount(path: Path): Result<Int> {
     }
 }
 
+data class FileInfo(val index: Long, val size: Long, val hardLinkAmount: Int) {
+    companion object {
+        fun from(path: Path): Result<FileInfo> {
+            return try {
+                val inode = getFileINode(path).getOrThrow()
+                val size = getActualSize(path).getOrThrow()
+                val hardLinkAmount = getHardLinkAmount(path).getOrThrow()
 
-private fun getFileINodeAndSize(path: Path): Result<Triple<Long, Long, Int>> =
-    try {
-        val inode = getFileINode(path).getOrThrow();
-
-        val size = getActualSize(path).getOrThrow();
-
-        val hardLinkAmount = getHardLinkAmount(path).getOrThrow();
-
-        Result.success(Triple(inode, size, hardLinkAmount))
-
-    }catch(e: Exception) {
-        Result.failure(e)
+                Result.success(FileInfo(inode, size, hardLinkAmount))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
     }
-
-
-data class FileInfo(val index: Long, val size: Long, val hardLinkAmount: Int)
+}
 
 // closure assepts a path to the file and its type for optimization
 private fun walkDir(dir: Path, closure: (Path, FileType) -> Result<Unit>) {
@@ -184,12 +206,16 @@ private fun solution(dir: Path): SolutionResult {
     val closure = closure@{ path: Path, fileType: FileType ->
         if (fileType != FileType.OTHER) {
             try {
-                val (iNodeIndex, size, hardLinkAmount) = getFileINodeAndSize(path).getOrThrow()
-
-                val file = FileInfo(iNodeIndex, size, hardLinkAmount)
                 // as some very popular file system prohibit hard link on directory usage (Apple fs, Windows, ext4) I will consider that hardlink on dir is forbidden
 
-                fileSizes[path] = size
+                val fileResult = FileInfo.from(path)
+                if (fileResult.isFailure) {
+                    return@closure Result.failure<Unit>(fileResult.exceptionOrNull()
+                        ?: Exception("Unknown error"))
+                }
+
+                val file = fileResult.getOrThrow()
+                fileSizes[path] = file.size
 
                 if (fileType == FileType.DIRECTORY) {
                     // far not the best design session but for simplicity I will leave it
